@@ -5,15 +5,17 @@ import hashlib
 from typing import List, Tuple, Iterable, Optional
 from dataclasses import dataclass
 
-import pefile
 import tabulate
 from typing_extensions import TypeAlias
 
 import floss.utils
 from floss.results import StaticString, StringEncoding
+from floss.language.binary import VA, Arch, Section, BinaryFile
 from floss.render.sanitize import sanitize
 
-VA: TypeAlias = int
+# section names that, by convention, may hold struct String instances
+# PE: .rdata / .data ; ELF: .rodata / .data.rel.ro / .data
+STRUCT_STRING_SECTION_NAMES = (".rdata", ".data", ".rodata", ".data.rel.ro")
 
 
 @dataclass(frozen=True)
@@ -60,19 +62,18 @@ class StructString:
     length: int
 
 
-def get_rdata_section(pe: pefile.PE) -> pefile.SectionStructure:
-    for section in pe.sections:
-        if section.Name.startswith(b".rdata\x00"):
-            return section
+def get_rdata_section(bf: BinaryFile) -> Section:
+    """
+    return the primary read-only data section.
 
-    raise ValueError("no .rdata section found")
+    PE: ``.rdata`` - ELF: ``.rodata``. Raises ValueError if not present.
+    """
+    return bf.get_read_only_data_section()
 
 
-def get_image_range(pe: pefile.PE) -> Tuple[VA, VA]:
+def get_image_range(bf: BinaryFile) -> Tuple[VA, VA]:
     """return the range of the image in memory."""
-    image_base = pe.OPTIONAL_HEADER.ImageBase
-    image_size = pe.OPTIONAL_HEADER.SizeOfImage
-    return image_base, image_base + image_size
+    return bf.image_range
 
 
 def find_amd64_lea_xrefs(buf: bytes, base_addr: VA) -> Iterable[VA]:
@@ -86,7 +87,7 @@ def find_amd64_lea_xrefs(buf: bytes, base_addr: VA) -> Iterable[VA]:
         # use rb, or else double escape the term "\x0D", or else beware!
         rb"""
         (?:                   # non-capturing group
-              \x48 \x8D \x05  # 48 8d 05 aa aa 00 00    lea    rax,[rip+0xaaaa] 
+              \x48 \x8D \x05  # 48 8d 05 aa aa 00 00    lea    rax,[rip+0xaaaa]
             | \x48 \x8D \x0D  # 48 8d 0d aa aa 00 00    lea    rcx,[rip+0xaaaa]
             | \x48 \x8D \x15  # 48 8d 15 aa aa 00 00    lea    rdx,[rip+0xaaaa]
             | \x48 \x8D \x1D  # 48 8d 1d aa aa 00 00    lea    rbx,[rip+0xaaaa]
@@ -142,23 +143,23 @@ def find_i386_lea_xrefs(buf: bytes) -> Iterable[VA]:
         yield address
 
 
-def find_lea_xrefs(pe: pefile.PE) -> Iterable[VA]:
+def find_lea_xrefs(bf: BinaryFile) -> Iterable[VA]:
     """
-    scan the executable sections of the given PE file
+    scan the executable sections of the given binary
     for LEA instructions that reference valid memory addresses,
     yielding the virtual addresses.
     """
-    low, high = get_image_range(pe)
+    low, high = bf.image_range
 
-    for section in pe.sections:
-        if not section.IMAGE_SCN_MEM_EXECUTE:
+    for section in bf.sections:
+        if not section.is_executable:
             continue
 
-        code = section.get_data()
+        code = section.data
 
-        if pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]:
-            xrefs = find_amd64_lea_xrefs(code, section.VirtualAddress + pe.OPTIONAL_HEADER.ImageBase)
-        elif pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_I386"]:
+        if bf.arch == Arch.AMD64:
+            xrefs = find_amd64_lea_xrefs(code, section.virtual_address)
+        elif bf.arch == Arch.I386:
             xrefs = find_i386_lea_xrefs(code)
         else:
             raise ValueError("unhandled architecture")
@@ -214,23 +215,23 @@ def find_amd64_push_xrefs(buf: bytes) -> Iterable[VA]:
         yield address
 
 
-def find_push_xrefs(pe: pefile.PE) -> Iterable[VA]:
+def find_push_xrefs(bf: BinaryFile) -> Iterable[VA]:
     """
-    scan the executable sections of the given PE file
+    scan the executable sections of the given binary
     for PUSH instructions that reference valid memory addresses,
     yielding the virtual addresses.
     """
-    low, high = get_image_range(pe)
+    low, high = bf.image_range
 
-    for section in pe.sections:
-        if not section.IMAGE_SCN_MEM_EXECUTE:
+    for section in bf.sections:
+        if not section.is_executable:
             continue
 
-        code = section.get_data()
+        code = section.data
 
-        if pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]:
+        if bf.arch == Arch.AMD64:
             xrefs = find_amd64_push_xrefs(code)
-        elif pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_I386"]:
+        elif bf.arch == Arch.I386:
             xrefs = find_i386_push_xrefs(code)
         else:
             raise ValueError("unhandled architecture")
@@ -297,23 +298,23 @@ def find_amd64_mov_xrefs(buf: bytes) -> Iterable[VA]:
         yield address
 
 
-def find_mov_xrefs(pe: pefile.PE) -> Iterable[VA]:
+def find_mov_xrefs(bf: BinaryFile) -> Iterable[VA]:
     """
-    scan the executable sections of the given PE file
+    scan the executable sections of the given binary
     for MOV instructions that reference valid memory addresses,
     yielding the virtual addresses.
     """
-    low, high = get_image_range(pe)
+    low, high = bf.image_range
 
-    for section in pe.sections:
-        if not section.IMAGE_SCN_MEM_EXECUTE:
+    for section in bf.sections:
+        if not section.is_executable:
             continue
 
-        code = section.get_data()
+        code = section.data
 
-        if pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]:
+        if bf.arch == Arch.AMD64:
             xrefs = find_amd64_mov_xrefs(code)
-        elif pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_I386"]:
+        elif bf.arch == Arch.I386:
             xrefs = find_i386_mov_xrefs(code)
         else:
             raise ValueError("unhandled architecture")
@@ -323,12 +324,12 @@ def find_mov_xrefs(pe: pefile.PE) -> Iterable[VA]:
                 yield xref
 
 
-def get_max_section_size(pe: pefile.PE) -> int:
+def get_max_section_size(bf: BinaryFile) -> int:
     """get the size of the largest section, as seen on disk."""
-    return max(map(lambda s: s.SizeOfRawData, pe.sections))
+    return bf.max_section_size
 
 
-def get_struct_string_candidates_with_pointer_size(pe: pefile.PE, buf: bytes, psize: int) -> Iterable[StructString]:
+def get_struct_string_candidates_with_pointer_size(bf: BinaryFile, buf: bytes, psize: int) -> Iterable[StructString]:
     """
     scan through the given bytes looking for pairs of machine words (address, length)
     that might potentially be struct String instances.
@@ -346,8 +347,18 @@ def get_struct_string_candidates_with_pointer_size(pe: pefile.PE, buf: bytes, ps
     if not buf:
         return
 
-    limit = get_max_section_size(pe)
-    low, high = get_image_range(pe)
+    limit = get_max_section_size(bf)
+    low, high = bf.image_range
+
+    # array.array requires the buffer length to be a multiple of the item size.
+    # PE sections are file-aligned (multiple of 8), but ELF sections are not, so
+    # trim any trailing bytes that don't complete a machine word.
+    word_bytes = psize // 8
+    remainder = len(buf) % word_bytes
+    if remainder:
+        buf = buf[:-remainder]
+    if not buf:
+        return
 
     # using array module as a high-performance way to access the data as fixed-sized words.
     words = iter(array.array(format, buf))
@@ -374,57 +385,57 @@ def get_struct_string_candidates_with_pointer_size(pe: pefile.PE, buf: bytes, ps
         yield StructString(address, length)
 
 
-def get_amd64_struct_string_candidates(pe: pefile.PE, buf: bytes) -> Iterable[StructString]:
-    yield from get_struct_string_candidates_with_pointer_size(pe, buf, 64)
+def get_amd64_struct_string_candidates(bf: BinaryFile, buf: bytes) -> Iterable[StructString]:
+    yield from get_struct_string_candidates_with_pointer_size(bf, buf, 64)
 
 
-def get_i386_struct_string_candidates(pe: pefile.PE, buf: bytes) -> Iterable[StructString]:
-    yield from get_struct_string_candidates_with_pointer_size(pe, buf, 32)
+def get_i386_struct_string_candidates(bf: BinaryFile, buf: bytes) -> Iterable[StructString]:
+    yield from get_struct_string_candidates_with_pointer_size(bf, buf, 32)
 
 
-def get_struct_string_candidates(pe: pefile.PE) -> Iterable[StructString]:
+def get_struct_string_candidates(bf: BinaryFile) -> Iterable[StructString]:
     """
-    find candidate struct String instances in the given PE file.
+    find candidate struct String instances in the given binary.
 
     we do some initial validation, like checking that the address is valid
     and the length is reasonable; however, we don't validate the encoded string data.
     """
-    image_base = pe.OPTIONAL_HEADER.ImageBase
-    low, high = get_image_range(pe)
+    low, high = bf.image_range
 
-    # cache the section data so that we can avoid pefile overhead
+    # cache the section data so that we can avoid per-section overhead
     section_datas: List[Tuple[VA, VA, memoryview]] = []
-    for section in pe.sections:
-        if not section.IMAGE_SCN_MEM_READ:
+    for section in bf.sections:
+        if not section.is_readable:
             continue
 
         section_datas.append(
             (
-                image_base + section.VirtualAddress,
-                image_base + section.VirtualAddress + section.SizeOfRawData,
+                section.virtual_address,
+                section.virtual_end,
                 # use memoryview here so that we can slice it quickly later
-                memoryview(section.get_data()),
+                memoryview(section.data),
             )
         )
 
-    for section in pe.sections:
-        if section.IMAGE_SCN_MEM_EXECUTE:
+    for section in bf.sections:
+        if section.is_executable:
             continue
 
-        if not section.IMAGE_SCN_MEM_READ:
+        if not section.is_readable:
             continue
 
         # TODO add .text here for Go version 1.12?
-        if not (section.Name.startswith(b".rdata\x00") or section.Name.startswith(b".data\x00")):
-            # by convention, the struct String instances are stored in the .rdata or .data section.
+        if section.name not in STRUCT_STRING_SECTION_NAMES:
+            # by convention, the struct String instances are stored in the
+            # read-only data or data sections.
             continue
 
-        data = section.get_data()
+        data = section.data
 
-        if pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]:
-            candidates = get_amd64_struct_string_candidates(pe, data)
-        elif pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_I386"]:
-            candidates = get_i386_struct_string_candidates(pe, data)
+        if bf.arch == Arch.AMD64:
+            candidates = get_amd64_struct_string_candidates(bf, data)
+        elif bf.arch == Arch.I386:
+            candidates = get_i386_struct_string_candidates(bf, data)
         else:
             raise ValueError("unhandled architecture")
 
@@ -433,22 +444,21 @@ def get_struct_string_candidates(pe: pefile.PE) -> Iterable[StructString]:
 
         for candidate in candidates:
             va = candidate.address
-            rva = va - image_base
 
             if not (low <= va < high):
                 continue
 
-            target_section = pe.get_section_by_rva(rva)
+            target_section = bf.get_section_by_va(va)
             if not target_section:
                 # string instance must be in a section
                 continue
 
             # TODO in older Go versions, e.g. 1.12, this may be the case (stored in .text), see 33b5da...
-            if target_section.IMAGE_SCN_MEM_EXECUTE:
+            if target_section.is_executable:
                 # string instances aren't found with the code
                 continue
 
-            if not target_section.IMAGE_SCN_MEM_READ:
+            if not target_section.is_readable:
                 # string instances must be readable, naturally
                 continue
 
@@ -474,14 +484,25 @@ def get_struct_string_candidates(pe: pefile.PE) -> Iterable[StructString]:
 
 
 def get_extract_stats(
-    pe: pefile, all_ss_strings: List[StaticString], lang_strings: List[StaticString], min_len: int, min_blob_len=0
+    bf: BinaryFile, all_ss_strings: List[StaticString], lang_strings: List[StaticString], min_len: int, min_blob_len=0
 ) -> float:
     # min_blob_len: this is the minimum length of a string blob in binary file to be considered for extraction
+    # name of the primary read-only data section for this format (.rdata / .rodata)
+    try:
+        rodata_name = bf.get_read_only_data_section().name
+    except ValueError:
+        rodata_name = ".rdata"
+
+    def section_name_by_offset(offset: int) -> str:
+        for section in bf.sections:
+            if section.raw_offset <= offset < section.raw_offset + section.raw_size:
+                return section.name
+        return ""
+
     all_strings = list()
     # these are ascii, extract these utf-8 to get fewer chunks (ascii may split on two-byte characters, for example)
     for ss in all_ss_strings:
-        sec = pe.get_section_by_rva(ss.offset)
-        secname = sec.Name.decode("utf-8").split("\x00")[0] if sec else ""
+        secname = section_name_by_offset(ss.offset)
         all_strings.append((secname, ss))
 
     len_all_ss = 0
@@ -490,7 +511,7 @@ def get_extract_stats(
     lang_str_found = list()
     results = list()
     for secname, s in all_strings:
-        if secname != ".rdata":
+        if secname != rodata_name:
             continue
 
         if len(s.string) <= min_blob_len:
@@ -506,10 +527,9 @@ def get_extract_stats(
 
         found = False
         for lang_str in lang_strings:
-            sec = pe.get_section_by_rva(lang_str.offset)
-            lang_str_sec = sec.Name.decode("utf-8").split("\x00")[0] if sec else ""
+            lang_str_sec = section_name_by_offset(lang_str.offset)
 
-            if lang_str_sec != ".rdata":
+            if lang_str_sec != rodata_name:
                 continue
 
             if (
@@ -557,9 +577,8 @@ def get_extract_stats(
 
     rows = list()
     for lang_str in lang_strings:
-        sec = pe.get_section_by_rva(lang_str.offset)
-        lang_str_sec = sec.Name.decode("utf-8").split("\x00")[0] if sec else ""
-        if lang_str_sec != ".rdata":
+        lang_str_sec = section_name_by_offset(lang_str.offset)
+        if lang_str_sec != rodata_name:
             continue
 
         if lang_str in lang_str_found:
@@ -641,13 +660,14 @@ def get_extract_stats(
         )
     )
 
-    print(".rdata only")
+    print(f"{rodata_name} only")
     print("len all string chars:", len_all_ss)
     print("len lang string chars  :", len_lang_str)
-    print(f"Percentage of string chars extracted: {round(100 * (len_lang_str / len_all_ss))}%")
+    if len_all_ss:
+        print(f"Percentage of string chars extracted: {round(100 * (len_lang_str / len_all_ss))}%")
     print()
 
-    return 100 * (len_lang_str / len_all_ss)
+    return 100 * (len_lang_str / len_all_ss) if len_all_ss else 0.0
 
 
 def get_missed_strings(

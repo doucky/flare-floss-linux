@@ -33,6 +33,7 @@ pyasn1==0.6.3
 pyasn1-modules==0.4.2
 pycodestyle==2.14.0
 pycparser==3.0
+pyelftools==0.33
 pydantic==2.13.1
 # pydantic pins pydantic-core, 
 # but dependabot updates these separately (which is broken) and is annoying,

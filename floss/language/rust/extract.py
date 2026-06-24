@@ -19,10 +19,10 @@ import argparse
 import itertools
 from typing import List, Tuple, Iterable, Optional
 
-import pefile
 import binary2strings as b2s
 
 from floss.results import StaticString, StringEncoding
+from floss.language.binary import Arch, BinaryFile, load_binary
 from floss.language.utils import (
     find_lea_xrefs,
     find_mov_xrefs,
@@ -121,47 +121,42 @@ def split_strings(static_strings: List[StaticString], address: int, min_length: 
 
 def extract_rust_strings(sample: pathlib.Path, min_length: int) -> List[StaticString]:
     """
-    Extract Rust strings from a sample
+    Extract Rust strings from a PE or ELF sample
     """
-
-    p = pathlib.Path(sample)
-    buf = p.read_bytes()
-    pe = pefile.PE(data=buf, fast_load=True)
+    bf = load_binary(sample)
 
     rust_strings: List[StaticString] = list()
-    rust_strings.extend(get_string_blob_strings(pe, min_length))
+    rust_strings.extend(get_string_blob_strings(bf, min_length))
 
     return rust_strings
 
 
 def get_static_strings_from_rdata(sample, static_strings) -> List[StaticString]:
-    pe = pefile.PE(data=pathlib.Path(sample).read_bytes(), fast_load=True)
+    bf = load_binary(sample)
 
     try:
-        rdata_section = get_rdata_section(pe)
+        rdata_section = get_rdata_section(bf)
     except ValueError:
         return []
 
-    start_rdata = rdata_section.PointerToRawData
-    end_rdata = start_rdata + rdata_section.SizeOfRawData
+    start_rdata = rdata_section.raw_offset
+    end_rdata = start_rdata + rdata_section.raw_size
 
     return list(filter(lambda s: start_rdata <= s.offset < end_rdata, static_strings))
 
 
-def get_string_blob_strings(pe: pefile.PE, min_length: int) -> Iterable[StaticString]:
-    image_base = pe.OPTIONAL_HEADER.ImageBase
-
+def get_string_blob_strings(bf: BinaryFile, min_length: int) -> Iterable[StaticString]:
     try:
-        rdata_section = get_rdata_section(pe)
+        rdata_section = get_rdata_section(bf)
     except ValueError as e:
         logger.error("cannot extract rust strings: %s", e)
         return []
 
-    start_rdata = rdata_section.PointerToRawData
-    end_rdata = start_rdata + rdata_section.SizeOfRawData
-    virtual_address = rdata_section.VirtualAddress
-    pointer_to_raw_data = rdata_section.PointerToRawData
-    buffer_rdata = rdata_section.get_data()
+    start_rdata = rdata_section.raw_offset
+    end_rdata = start_rdata + rdata_section.raw_size
+    virtual_address = rdata_section.virtual_address
+    pointer_to_raw_data = rdata_section.raw_offset
+    buffer_rdata = rdata_section.data
 
     # extract utf-8 and wide strings, latter not needed here
     strings = b2s.extract_all_strings(buffer_rdata, min_length)
@@ -175,16 +170,16 @@ def get_string_blob_strings(pe: pefile.PE, min_length: int) -> Iterable[StaticSt
     #  .rdata:00000001400C1271 70 61 6E 69 63 6B 65 64…                db 'panicked after panic::always_abort(), aborting.',0Ah,0
     #  .rdata:00000001400C12A2 00 00 00 00 00 00                       align 8
 
-    struct_string_addrs = map(lambda c: c.address, get_struct_string_candidates(pe))
+    struct_string_addrs = map(lambda c: c.address, get_struct_string_candidates(bf))
 
-    if pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_I386"]:
-        xrefs_lea = find_lea_xrefs(pe)
-        xrefs_push = find_push_xrefs(pe)
-        xrefs_mov = find_mov_xrefs(pe)
+    if bf.arch == Arch.I386:
+        xrefs_lea = find_lea_xrefs(bf)
+        xrefs_push = find_push_xrefs(bf)
+        xrefs_mov = find_mov_xrefs(bf)
         xrefs = itertools.chain(struct_string_addrs, xrefs_lea, xrefs_push, xrefs_mov)
 
-    elif pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]:
-        xrefs_lea = find_lea_xrefs(pe)
+    elif bf.arch == Arch.AMD64:
+        xrefs_lea = find_lea_xrefs(bf)
         xrefs = itertools.chain(struct_string_addrs, xrefs_lea)
 
         # TODO(mr-tz) - handle movdqa rust-hello64.exe
@@ -193,11 +188,15 @@ def get_string_blob_strings(pe: pefile.PE, min_length: int) -> Iterable[StaticSt
         #  .text:0000000140026056 66 0F 6F 15 12 71 09 00                 movdqa  xmm2, cs:xmmword_1400BD170
 
     else:
-        logger.error("unsupported architecture: %s", pe.FILE_HEADER.Machine)
+        logger.error("unsupported architecture: %s", bf.arch)
         return []
 
     for addr in xrefs:
-        address = addr - image_base - virtual_address + pointer_to_raw_data
+        # translate the referenced virtual address into a file offset within
+        # the read-only data section, mirroring the original PE arithmetic:
+        #   (addr - image_base) - section_rva + section_raw_offset
+        # with absolute section VAs this simplifies to the expression below.
+        address = addr - virtual_address + pointer_to_raw_data
 
         if not (start_rdata <= address < end_rdata):
             continue

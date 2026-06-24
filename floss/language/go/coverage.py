@@ -18,11 +18,10 @@ import pathlib
 import argparse
 from typing import List
 
-import pefile
-
 from floss.utils import get_static_strings
 from floss.results import StaticString, StringEncoding
 from floss.language.utils import get_extract_stats
+from floss.language.binary import load_binary
 from floss.language.go.extract import extract_go_strings
 
 logger = logging.getLogger(__name__)
@@ -58,13 +57,13 @@ def main():
         logging.basicConfig(level=logging.INFO)
         logging.getLogger().setLevel(logging.INFO)
 
-    try:
-        pe = pefile.PE(args.path)
-    except pefile.PEFormatError as err:
-        logger.debug(f"NOT a valid PE file: {err}")
-        return 1
-
     path = pathlib.Path(args.path)
+
+    try:
+        bf = load_binary(path.read_bytes())
+    except ValueError as err:
+        logger.debug(f"NOT a supported PE/ELF file: {err}")
+        return 1
 
     static_strings: List[StaticString] = get_static_strings(path, args.min_length)
 
@@ -74,7 +73,7 @@ def main():
     # of go binaries that include versions 1.20, 1.18, 1.16, 1.12. and
     # architectures amd64 and i386.
     # See: https://github.com/mandiant/flare-floss/issues/807#issuecomment-1636087673
-    get_extract_stats(pe, static_strings, go_strings, args.min_length, 2800)
+    get_extract_stats(bf, static_strings, go_strings, args.min_length, 2800)
 
 
 if __name__ == "__main__":
