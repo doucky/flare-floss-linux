@@ -19,10 +19,9 @@ import pathlib
 import argparse
 from typing import List, Tuple, Iterable, Optional
 
-import pefile
-
 from floss.strings import extract_ascii_unicode_strings
 from floss.language.utils import get_extract_stats
+from floss.language.binary import load_binary
 from floss.language.rust.extract import extract_rust_strings
 
 logger = logging.getLogger(__name__)
@@ -58,17 +57,14 @@ def main():
         logging.basicConfig(level=logging.INFO)
         logging.getLogger().setLevel(logging.INFO)
 
-    try:
-        pe = pefile.PE(args.path)
-    except pefile.PEFormatError as err:
-        logger.debug(f"NOT a valid PE file: {err}")
-        return 1
-
     path = pathlib.Path(args.path)
 
-    # see only .rdata section
-    buf = path.read_bytes()
-    pe = pefile.PE(data=buf, fast_load=True)
+    try:
+        buf = path.read_bytes()
+        bf = load_binary(buf)
+    except ValueError as err:
+        logger.debug(f"NOT a supported PE/ELF file: {err}")
+        return 1
 
     static_strings = list(extract_ascii_unicode_strings(buf, args.min_length))
 
@@ -76,7 +72,7 @@ def main():
 
     # The min_blob_length value was chosen as 0 because in rust binaries, the
     # string blobs are small and the min_blob_length value is not needed.
-    get_extract_stats(pe, static_strings, rust_strings, args.min_length, 0)
+    get_extract_stats(bf, static_strings, rust_strings, args.min_length, 0)
 
 
 if __name__ == "__main__":

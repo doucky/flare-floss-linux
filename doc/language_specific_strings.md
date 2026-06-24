@@ -1,3 +1,8 @@
+> **Supported formats:** Go and Rust string extraction works on both Windows **PE**
+> and Linux **ELF** binaries (i386 and amd64). The format is detected automatically
+> from the file magic. See [`elf_support.md`](./elf_support.md) for the ELF
+> architecture, PIE/relocation handling, and limitations.
+
 ## Go String Extraction
 Programs compiled by the Go compiler use a string representation that is difficult to interpret by humans. Although they are UTF-8 encoded, and therefore show up in the output of `strings.exe`, program strings are not NULL-terminated. This means separate strings within the binary may appear as a large chunk of indistinguishable string data.
 

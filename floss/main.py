@@ -198,6 +198,7 @@ def make_parser(argv):
     formats = [
         ("auto", "(default) detect file type automatically"),
         ("pe", "Windows PE file"),
+        ("elf", "Linux ELF file"),
         ("sc32", "32-bit shellcode"),
         ("sc64", "64-bit shellcode"),
     ]
